@@ -1,1 +1,73 @@
-build/**
+
+# ====================================================================
+# STM32CubeMX / STM32CubeIDE Production .gitignore Template
+# ====================================================================
+
+# --------------------------------------------------------------------
+# 1. Compilation & Build Artifacts (Never track)
+# --------------------------------------------------------------------
+*.o
+*.d
+*.crf
+*.elf
+*.map
+*.bin
+*.hex
+*.srec
+*.lst
+*.su
+*.cyclo
+*.a
+*.lib
+*.bak
+*.log
+*.dep
+*.tmp
+
+# --------------------------------------------------------------------
+# 2. Toolchain / IDE Output Folders
+# --------------------------------------------------------------------
+[Dd]ebug/
+[Rr]elease/
+[Bb]uild/
+
+# --------------------------------------------------------------------
+# 3. STM32CubeMX Specific Exclusions
+# --------------------------------------------------------------------
+# Scratch file used by CubeMX during generation (contains temporary state)
+mx.scratch
+
+# --------------------------------------------------------------------
+# 4. IDE-Specific Meta & Local Configurations
+# --------------------------------------------------------------------
+# STM32CubeIDE / Eclipse local user settings
+.metadata/
+.settings/
+
+# If you share debugger setups, comment out the line below:
+*.launch
+
+# Keil uVision local files
+*.uvguix.*
+*.uv2.bak
+*.pjt
+RTE/
+
+# IAR Embedded Workbench local files
+*.ewt
+*.ewp.bak
+settings/
+
+# VS Code local environment setups
+.vscode/ipch/
+.vscode/.cmaketools/
+# Un-comment the line below if team members use different local paths:
+# .vscode/settings.json
+
+# --------------------------------------------------------------------
+# 5. Operating System Junk
+# --------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*~
+*.swp
