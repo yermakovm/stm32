@@ -50,7 +50,7 @@ int main(void)
     MX_USART1_UART_Init();
     MX_USART2_UART_Init();
 
-    /* Boot sanity blink: PC13 twice */
+    /* Boot sanity blink */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
     HAL_Delay(200);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
@@ -67,9 +67,9 @@ int main(void)
 
     while (1)
     {
-        /* RX from ESP32. Never log per byte: log_* blocks ~90 us/char at
-         * 115200 while the ESP's 3-byte frame takes only ~87 us/byte, which
-         * causes RX overruns. Log only when a full frame has been parsed. */
+        /* RX from ESP32. Never log per byte: blocking at ~90 us/char is slower
+         * than one incoming byte (87 us) and would overrun USART2 RX. Log only
+         * once a whole frame is parsed. */
         uint8_t rx_byte = 0;
         if (HAL_UART_Receive(&huart2, &rx_byte, 1, 10) == HAL_OK)
         {
@@ -100,7 +100,7 @@ int main(void)
             }
         }
 
-        /* Button PA15: send one frame on the press edge after 30 ms stable. */
+        /* Button PA15: send one frame per press edge, after 30 ms of stability. */
         int raw = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_RESET) ? 1 : 0;
         if (raw != btn_raw)
         {
