@@ -1,225 +1,403 @@
-/* STM32F401CE (Black Pill) <-> ESP32-S3 UART link
+/**
+ * Casio-style desk clock.
  *
- * USART1 (PA9/PA10)  @115200 -> debug log to PC via ST-Link USB
- * USART2 (PA2/PA3)   @115200 -> ESP32: ESP GPIO17->PA3, GPIO18<-PA2, GND<->GND
- * Frame (both dirs):  0xA5 | cmd | header^cmd     (CMD_TOGGLE_LEDS = 0x01)
- * PA15 = button (active-low), PC13 = onboard LED (active-low)
+ *   STM32F401CEU6
+ *     USART1 PA9/PA10 @115200 -> USB-TTL for the log
+ *     I2C1 PB8 (SCL) / PB9 (SDA) -> SSD1306 0x3C, DS1307 0x68,
+ *                                    AT24C32 0x50
+ *
+ * Nothing else is attached: no button, no ESP32 link, no status LED.
+ * The screen is refreshed once per second (plus one animated frame
+ * every UI_FRAME_MS so the roll/spinner look smooth).
  */
 
-#include "main.h"
 #include <string.h>
 
-#define FRAME_HEADER     0xA5U
-#define CMD_TOGGLE_LEDS  0x01U
-#define FRAME_LEN        3U
+#include "at24.h"
+#include "board.h"
+#include "ds1307.h"
+#include "face_casio.h"
+#include "gfx.h"
+#include "i2c_bus.h"
+#include "ilog.h"
+#include "ssd1306.h"
 
-UART_HandleTypeDef huart1;  /* debug log */
-UART_HandleTypeDef huart2;  /* ESP32 link */
+#define BACKUP_MAGIC 0xC5U
 
-uint8_t rx_frame[FRAME_LEN];
-uint32_t rx_pos = 0;
-int btn_last = 0, btn_raw = 0;
-uint32_t btn_change_ms = 0;
+/* Time shown on screen, plus how it was obtained. */
+static ds1307_time_t s_time;
+static bool s_time_valid;
+static bool s_time_is_backup;
+static uint32_t s_last_rtc_read_ms;
+static uint32_t s_last_backup_min = 0xFFFFFFFFU;
 
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_USART1_UART_Init(void);
-static void MX_USART2_UART_Init(void);
+/* Last time we actually believed, and when: if the RTC stops answering
+ * the face keeps counting from here instead of freezing. */
+static ds1307_time_t s_seed;
+static uint32_t s_seed_ms;
 
-static void log_str(const char *s)
+/* ------------------------------------------------------------------ */
+/* time seeding                                                        */
+/* ------------------------------------------------------------------ */
+
+static const char MONTH_ABBR[12][4] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+};
+
+/* Sakamoto's algorithm: 0 = Sunday ... 6 = Saturday. */
+static uint8_t day_of_week(uint16_t y, uint8_t m, uint8_t d)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t *)s, strlen(s), 100);
+    static const uint8_t T[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    uint16_t year = y;
+
+    if (m < 3U) {
+        year--;
+    }
+    return (uint8_t)((year + year / 4U - year / 100U + year / 400U +
+                      T[m - 1U] + d) % 7U);
 }
 
-static void log_hex8(uint8_t val)
+/* Fill t from the build stamp. The caller must pass a zeroed struct:
+ * an unknown month abbreviation leaves month == 0 and the function
+ * returns false. */
+static bool parse_build_stamp(ds1307_time_t *t)
 {
-    char buf[4];
-    const char hex[] = "0123456789ABCDEF";
-    buf[0] = hex[(val >> 4) & 0x0F];
-    buf[1] = hex[val & 0x0F];
-    buf[2] = '\r';
-    buf[3] = '\n';
-    HAL_UART_Transmit(&huart1, (uint8_t *)buf, 4, 100);
+    /* __DATE__ = "Sep  4 2026", __TIME__ = "21:23:45". */
+    const char *d = __DATE__;
+    const char *tm = __TIME__;
+
+    for (uint8_t i = 0U; i < 12U; i++) {
+        if (memcmp(d, MONTH_ABBR[i], 3U) == 0) {
+            t->month = (uint8_t)(i + 1U);
+            break;
+        }
+    }
+    if (t->month == 0U) {
+        return false;
+    }
+
+    t->date = (uint8_t)((d[4] == ' ' ? 0U : (d[4] - '0') * 10U) +
+                        (d[5] - '0'));
+    /* __DATE__ is e.g. "Sep  5 2026": day is right-aligned at d[4..5],
+     * the year is the LAST two chars, at d[9..10]. */
+    t->year = (uint8_t)(((d[9] - '0') * 10U) + (d[10] - '0'));
+    t->hour = (uint8_t)((tm[0] - '0') * 10U + (tm[1] - '0'));
+    t->minute = (uint8_t)((tm[3] - '0') * 10U + (tm[4] - '0'));
+    t->second = (uint8_t)((tm[6] - '0') * 10U + (tm[7] - '0'));
+    t->day = (uint8_t)(day_of_week(2000U + t->year, t->month, t->date) + 1U);
+    t->pm = false;
+    t->oscillator_halted = false;
+    return true;
+}
+
+/* Days in month (1..12) of the given 2-digit year. Only exact for
+ * 1970..2099, which is all a build stamp can ever mean here. */
+static uint8_t days_in_month(uint8_t month, uint8_t year)
+{
+    static const uint8_t dm[12] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    };
+
+    if (month < 1U || month > 12U) {
+        return 30U;
+    }
+    if (month == 2U && (year % 4U) == 0U) {
+        return 29U;
+    }
+    return dm[month - 1U];
+}
+
+/* Rough seconds since 2000-01-01 from a 2-digit-year time (only
+ * meaningful within 2000..2099, which is all we can represent).
+ * Used only to compare which of two times is newer, so a possible
+ * one-day skew around 29 Feb does not matter. */
+static uint64_t seconds_since_2000(const ds1307_time_t *t)
+{
+    static const uint16_t CUM_DAYS[12] = {
+        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334,
+    };
+    const uint64_t y = t->year;
+    uint64_t days = (y * 365ULL) + ((y == 0U) ? 0U : ((y + 3U) / 4U));
+
+    days += CUM_DAYS[(t->month >= 1U && t->month <= 12U) ? t->month - 1U
+                                                           : 0U];
+    days += (t->date >= 1U) ? (t->date - 1U) : 0U;
+
+    return (days * 86400ULL) +
+           (uint64_t)ds1307_seconds_of_day(t);
+}
+
+/* Add seconds to a time, rolling over into the next day/month/year.
+ * Used to derive the displayed time from the seed while the RTC is
+ * unreachable, so a few days of drift are tolerated rather than the
+ * clock standing still. */
+static void advance_time(ds1307_time_t *t, uint32_t seconds)
+{
+    uint32_t sod = ds1307_seconds_of_day(t) + seconds;
+
+    while (sod >= 86400U) {
+        uint8_t dim;
+
+        sod -= 86400U;
+        dim = days_in_month(t->month, t->year);
+        if (t->date >= dim) {
+            t->date = 1U;
+            if (t->month >= 12U) {
+                t->month = 1U;
+                t->year = (uint8_t)(t->year + 1U);
+            } else {
+                t->month = (uint8_t)(t->month + 1U);
+            }
+        } else {
+            t->date = (uint8_t)(t->date + 1U);
+        }
+        t->day = (uint8_t)((t->day == 0U ? 1U : t->day) % 7U) + 1U;
+    }
+
+    t->hour = (uint8_t)(sod / 3600U);
+    t->minute = (uint8_t)((sod % 3600U) / 60U);
+    t->second = (uint8_t)(sod % 60U);
+}
+
+static void seed_time(const ds1307_time_t *t, uint32_t at_ms)
+{
+    s_seed = *t;
+    s_seed_ms = at_ms;
+}
+
+static void derive_from_seed(uint32_t now_ms)
+{
+    s_time = s_seed;
+    advance_time(&s_time, (uint32_t)(now_ms - s_seed_ms) / 1000U);
+}
+
+/* EEPROM layout at TIME_BACKUP_EEPROM_ADDR:
+ * [0]=magic, [1]=hour, [2]=minute, [3]=second, [4]=day,
+ * [5]=date, [6]=month, [7]=year. */
+static bool backup_load(ds1307_time_t *t)
+{
+    uint8_t blob[8];
+
+    if (!at24_read(TIME_BACKUP_EEPROM_ADDR, blob, sizeof(blob))) {
+        return false;
+    }
+    if (blob[0] != BACKUP_MAGIC) {
+        return false;
+    }
+
+    t->hour = blob[1];
+    t->minute = blob[2];
+    t->second = blob[3];
+    t->day = blob[4];
+    t->date = blob[5];
+    t->month = blob[6];
+    t->year = blob[7];
+    t->day = (t->day >= 1U && t->day <= 7U) ? t->day : 1U;
+    t->hour %= 24U;
+    t->minute %= 60U;
+    t->second %= 60U;
+    t->pm = false;
+    t->oscillator_halted = false;
+    return true;
+}
+
+static void backup_save(const ds1307_time_t *t)
+{
+    uint8_t blob[8] = {
+        BACKUP_MAGIC, t->hour, t->minute, t->second,
+        t->day, t->date, t->month, t->year,
+    };
+
+    if (!at24_write(TIME_BACKUP_EEPROM_ADDR, blob, sizeof(blob))) {
+        LOGE("eeprom: could not save time backup");
+    }
+}
+
+/* One-line summary of the time we actually show, plus where it came
+ * from, so the boot log makes the setup obvious. */
+static void log_clock_state(const char *phase)
+{
+    static const char DAY_ABBR[7][4] = {
+        "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+    };
+    const uint8_t dow = (s_time.day >= 1U && s_time.day <= 7U)
+                            ? s_time.day : 1U;
+
+    LOGI("clock: %s -> %u-%02u-%02u (%s) %02u:%02u:%02u [%s]",
+         phase,
+         2000U + (unsigned int)s_time.year, (unsigned int)s_time.month,
+         (unsigned int)s_time.date, DAY_ABBR[dow - 1U],
+         (unsigned int)s_time.hour, (unsigned int)s_time.minute,
+         (unsigned int)s_time.second,
+         !s_time_valid ? "INVALID, no source"
+                       : (s_time_is_backup
+                              ? "seeded, RTC not trusted"
+                              : "RTC"));
+}
+
+/* Get a usable time: prefer the RTC, then the build stamp (freshest),
+ * then the EEPROM backup (may be stale). Whatever we end up with
+ * becomes the seed, so the clock keeps counting even when nothing
+ * answers on the bus. */
+static void acquire_time(void)
+{
+    ds1307_time_t t = {0};
+    const uint32_t now = board_ms();
+
+    if (!ds1307_read(&t)) {
+        if (!s_time_valid) {
+            /* Build stamp first: it is the compile-time clock, which is
+             * newer by definition than a backup saved during an earlier
+             * run (the backup just replays whatever we last believed,
+             * including a stale seed). */
+            if (!parse_build_stamp(&t) && !backup_load(&t)) {
+                LOGE("clock: no time source available");
+                return;
+            }
+            seed_time(&t, now);
+            LOGI("clock: RTC never answered, running from the "
+                 "backup/build stamp");
+            s_time_is_backup = true;
+        } else if (!s_time_is_backup) {
+            LOGE("rtc: DS1307 stopped answering, counting from "
+                 "the last known time");
+            s_time_is_backup = true;
+        }
+        derive_from_seed(now);
+        s_time_valid = true;
+        return;
+    }
+
+    if (t.oscillator_halted) {
+        LOGI("rtc: oscillator stopped, seeding from build stamp/backup");
+        if (parse_build_stamp(&t)) {
+            LOGI("clock: seeding from build stamp %s %s", __DATE__, __TIME__);
+        } else if (backup_load(&t)) {
+            LOGI("clock: no build stamp usable, restored last saved time");
+        } else {
+            LOGE("clock: no time source available");
+            s_time_valid = false;
+            return;
+        }
+        if (ds1307_write(&t)) {
+            LOGI("clock: wrote seed time to DS1307");
+        } else {
+            LOGE("rtc: seed write failed, showing seed anyway");
+            /* The seed is still the best guess, but it is not ticking,
+             * so derive it from board_ms() instead of the RTC. */
+            seed_time(&t, now);
+            s_time_is_backup = true;
+            derive_from_seed(now);
+            s_time_valid = true;
+            return;
+        }
+    } else if (RTC_SEED_FROM_BUILD_STAMP) {
+        /* The RTC may be running but stuck on an old seed (e.g. a
+         * previous flash wrote a stale build stamp or backup). The
+         * build stamp is the compile time of THIS image, so if it
+         * is newer than what the RTC believes, re-seed the RTC. */
+        ds1307_time_t stamp = {0};
+
+        if (parse_build_stamp(&stamp) &&
+            seconds_since_2000(&stamp) > seconds_since_2000(&t)) {
+            LOGI("rtc: time older than build stamp, re-seeding");
+            if (ds1307_write(&stamp)) {
+                t = stamp;
+            } else {
+                LOGE("rtc: re-seed write failed, keeping RTC time");
+            }
+        }
+        s_time_is_backup = false;
+    }
+
+    s_time = t;
+    s_time_valid = true;
+    seed_time(&t, now);
+
+    /* One EEPROM write per minute at most: keeps the 1 M cycle budget
+     * comfortable and still survives a battery swap. */
+    if (t.second == 0U && s_last_backup_min != t.minute) {
+        s_last_backup_min = t.minute;
+        backup_save(&t);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* boot + main loop                                                    */
+/* ------------------------------------------------------------------ */
+
+static void boot(void)
+{
+    if (!i2c_bus_init()) {
+        board_fatal("i2c_bus_init");
+    }
+    LOGI("i2c1 ready: PB8=SCL, PB9=SDA @%lu Hz",
+         (unsigned long)I2C_BUS_CLK_SPEED);
+    i2c_bus_scan();
+
+    acquire_time();
+    log_clock_state("boot");
+
+    if (!ssd1306_init()) {
+        LOGE("display: no SSD1306 at 0x%02x - showing nothing",
+             SSD1306_I2C_ADDR7);
+    }
+    face_init();
+
+    /* Push the very first frame even if the time came from the seed. */
+    face_draw(&s_time, s_time_valid, board_ms());
+    if (!ssd1306_flush()) {
+        LOGE("display: first frame never made it to the panel");
+    }
 }
 
 int main(void)
 {
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init();
-    MX_USART1_UART_Init();
-    MX_USART2_UART_Init();
+    uint32_t next_frame;
+    uint32_t next_screen_try;
 
-    /* Boot sanity blink */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-    HAL_Delay(200);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-    HAL_Delay(200);
+    board_init();
+    log_init();
+    log_str("\r\n===== STM32F401 + DS1307 + SSD1306 =====\r\n");
+    boot();
 
-    log_str("\r\n========== BOOT ==========\r\n");
-    log_str("USART1 debug + USART2 ESP link ready\r\n");
-    log_str("============================\r\n");
+    next_frame = board_ms() + UI_FRAME_MS;
+    next_screen_try = board_ms() + SCREEN_RETRY_MS;
+    for (;;) {
+        uint32_t now = board_ms();
 
-    /* Let boot log flush, then drain any garbage in the USART2 RX register */
-    HAL_Delay(200);
-    uint8_t drain;
-    while (HAL_UART_Receive(&huart2, &drain, 1, 0) == HAL_OK) {}
+        /* Poll the clock once per second: the seconds digit changes
+         * right after that read, which is what triggers the animation. */
+        if (now - s_last_rtc_read_ms >= 1000U) {
+            s_last_rtc_read_ms = now;
+            acquire_time();
+        }
 
-    while (1)
-    {
-        /* RX from ESP32. Never log per byte: blocking at ~90 us/char is slower
-         * than one incoming byte (87 us) and would overrun USART2 RX. Log only
-         * once a whole frame is parsed. */
-        uint8_t rx_byte = 0;
-        if (HAL_UART_Receive(&huart2, &rx_byte, 1, 10) == HAL_OK)
-        {
-            if (rx_pos == 0)
-            {
-                if (rx_byte == FRAME_HEADER) rx_frame[rx_pos++] = rx_byte;
+        if (ssd1306_is_alive()) {
+            face_draw(&s_time, s_time_valid, now);
+            if (!ssd1306_flush()) {
+                LOGE("display: refresh failed, retrying in %u ms",
+                     (unsigned)SCREEN_RETRY_MS);
             }
-            else
-            {
-                rx_frame[rx_pos++] = rx_byte;
-                if (rx_pos == FRAME_LEN)
-                {
-                    uint8_t crc_calc = rx_frame[0] ^ rx_frame[1];
-                    rx_pos = 0;
-                    if (rx_frame[2] != crc_calc)
-                    {
-                        log_str("BAD ");
-                        log_hex8(rx_frame[0]);
-                        log_hex8(rx_frame[1]);
-                        log_hex8(rx_frame[2]);
-                    }
-                    else if (rx_frame[1] == CMD_TOGGLE_LEDS)
-                    {
-                        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-                        log_str("TOGGLE\r\n");
-                    }
-                }
+        } else if (now >= next_screen_try) {
+            next_screen_try = now + SCREEN_RETRY_MS;
+            if (ssd1306_init()) {
+                LOGI("display: panel answered again");
+                face_init();
+            } else {
+                LOGE("display: still no SSD1306 at 0x%02x",
+                     SSD1306_I2C_ADDR7);
             }
         }
 
-        /* Button PA15: send one frame per press edge, after 30 ms of stability. */
-        int raw = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_RESET) ? 1 : 0;
-        if (raw != btn_raw)
-        {
-            btn_raw = raw;
-            btn_change_ms = HAL_GetTick();
+        /* Keep the frame rate steady instead of spinning on the bus. */
+        while (board_ms() < next_frame) {
+            HAL_Delay(2);
         }
-        if ((HAL_GetTick() - btn_change_ms >= 30) && (btn_raw != btn_last))
-        {
-            btn_last = btn_raw;
-            if (btn_raw)
-            {
-                const uint8_t frame[3] = {FRAME_HEADER, CMD_TOGGLE_LEDS, FRAME_HEADER ^ CMD_TOGGLE_LEDS};
-                HAL_UART_Transmit(&huart2, (uint8_t *)frame, 3, 100);
-                log_str("BTN\r\n");
-            }
+        next_frame += UI_FRAME_MS;
+        if ((int32_t)(next_frame - board_ms()) <= 0) {
+            next_frame = board_ms() + UI_FRAME_MS;  /* missed a frame */
         }
     }
 }
-
-/* HSI 16 MHz -> /8 *168 /4 = 84 MHz SYSCLK; APB1 = 42 MHz, APB2 = 84 MHz */
-void SystemClock_Config(void)
-{
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-    RCC_OscInitStruct.PLL.PLLM = 8;
-    RCC_OscInitStruct.PLL.PLLN = 168;
-    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
-    RCC_OscInitStruct.PLL.PLLQ = 7;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-    {
-        Error_Handler();
-    }
-
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                                |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-    {
-        Error_Handler();
-    }
-}
-
-/* USART1: debug log to PC (PA9 TX / PA10 RX, pins set in HAL_UART_MspInit) */
-static void MX_USART1_UART_Init(void)
-{
-    huart1.Instance = USART1;
-    huart1.Init.BaudRate = 115200;
-    huart1.Init.WordLength = UART_WORDLENGTH_8B;
-    huart1.Init.StopBits = UART_STOPBITS_1;
-    huart1.Init.Parity = UART_PARITY_NONE;
-    huart1.Init.Mode = UART_MODE_TX_RX;
-    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-    if (HAL_UART_Init(&huart1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-}
-
-/* USART2: ESP32 link */
-static void MX_USART2_UART_Init(void)
-{
-    huart2.Instance = USART2;
-    huart2.Init.BaudRate = 115200;
-    huart2.Init.WordLength = UART_WORDLENGTH_8B;
-    huart2.Init.StopBits = UART_STOPBITS_1;
-    huart2.Init.Parity = UART_PARITY_NONE;
-    huart2.Init.Mode = UART_MODE_TX_RX;
-    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-    if (HAL_UART_Init(&huart2) != HAL_OK)
-    {
-        Error_Handler();
-    }
-}
-
-static void MX_GPIO_Init(void)
-{
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-
-    /* PC13: onboard LED, active-low -> off */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-    GPIO_InitStruct.Pin = GPIO_PIN_13;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-    /* PA15: button, active-low with internal pull-up */
-    GPIO_InitStruct.Pin = GPIO_PIN_15;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-}
-
-void Error_Handler(void)
-{
-    __disable_irq();
-    while (1) {}
-}
-
-#ifdef USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line)
-{
-    (void)file;
-    (void)line;
-    Error_Handler();
-}
-#endif
