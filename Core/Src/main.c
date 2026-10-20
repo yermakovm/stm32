@@ -4,7 +4,8 @@
  *   STM32F401CEU6
  *     USART1 PA9/PA10 @115200 -> USB-TTL for the log
  *     I2C1 PB8 (SCL) / PB9 (SDA) -> SSD1306 0x3C, DS1307 0x68,
- *                                    AT24C32 0x50, BME280 0x76/0x77
+ *                                    AT24C32 0x50
+ *     SPI2 PB13/14/15 + PB12 (CS) -> BME280 (CSB tied to GND)
  *
  * Nothing else is attached: no button, no ESP32 link, no status LED.
  * The screen is refreshed once per second (plus one animated frame
@@ -377,6 +378,9 @@ static void sensor_update(uint32_t now)
     if (!bme280_is_present()) {
         if ((int32_t)(now - s_next_sensor_retry) >= 0) {
             s_next_sensor_retry = now + SENSOR_RETRY_MS;
+            LOGT("sensor: re-probing SPI2 (spi errors %u, i2c errors %u)",
+                 (unsigned)bme280_error_count(),
+                 (unsigned)i2c_bus_error_count());
             if (bme280_init()) {
                 s_sensor_state = SENSOR_ARMED;
                 s_last_sample_ms = now - SENSOR_PERIOD_MS;
@@ -477,6 +481,15 @@ static void boot(void)
     if (bme280_init()) {
         sensor_first();
     } else {
+        /* "No connection" has three different shapes - bus dead, chip
+         * not selected, chip present but unhappy - and each one shows
+         * up in one of these three dumps. */
+        spi_bus_diag("after failed sensor probe");
+        bme280_diag();
+        if (i2c_bus_present(BME280_I2C_ADDR_LOW) ||
+            i2c_bus_present(BME280_I2C_ADDR_HIGH)) {
+            LOGE("sensor: a chip ACKs on I2C1 0x76/0x77 while this driver talks SPI2 - the module is wired for I2C: move it to PB12..PB15 with CSB to GND, or move the driver to I2C1");
+        }
         LOGI("sensor: no BME280 on SPI2, the sensor row stays empty");
     }
 

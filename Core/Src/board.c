@@ -10,6 +10,8 @@
 
 #include "board.h"
 
+#include "ilog.h"
+
 /* Set by board_fatal() so it can be read from a debugger / core dump. */
 volatile const char *board_fatal_reason;
 
@@ -67,6 +69,12 @@ void board_fatal(const char *where)
 {
     board_fatal_reason = where;
     __disable_irq();
+    /* The log is polling TX, so it still works with interrupts off.
+     * If this line appears it is the last thing this run will ever
+     * print; if nothing appears at all, the fatal happened before
+     * log_init() and only board_fatal_reason / a core dump says
+     * where. */
+    LOGE("fatal: halted in %s", (where != NULL) ? where : "(unknown)");
     for (;;) {
         __NOP();
     }

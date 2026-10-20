@@ -37,6 +37,15 @@ void spi_bus_cs(bool asserted);
 /* One full-duplex transfer of len bytes. tx or rx may be NULL. */
 bool spi_bus_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len);
 
+/* Bus-level wait (1 ms granularity) for drivers that must respect a
+ * chip-internal timing instead of just polling as fast as possible. */
+void spi_bus_wait_ms(uint32_t ms);
+
+/* Log the pad levels, SPI2 CR1/SR and the error state: the difference
+ * between "sensor not wired", "peripheral broken" and "wiring fine,
+ * chip unhappy". */
+void spi_bus_diag(const char *why);
+
 bool spi_bus_is_ready(void);
 uint32_t spi_bus_error_count(void);
 

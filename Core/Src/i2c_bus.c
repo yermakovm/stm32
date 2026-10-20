@@ -15,6 +15,7 @@
 static I2C_HandleTypeDef s_i2c;
 static uint32_t s_errors;
 static uint32_t s_streak;
+static HAL_StatusTypeDef s_last_status = HAL_OK;
 
 /* ------------------------------------------------------------------ */
 /* init / recovery                                                     */
@@ -104,6 +105,52 @@ static bool bus_recover(void)
     return HAL_GPIO_ReadPin(BOARD_I2C_GPIO, BOARD_I2C_SDA_PIN) == GPIO_PIN_SET;
 }
 
+static const char *status_name(HAL_StatusTypeDef st)
+{
+    switch (st) {
+    case HAL_OK:       return "ok";
+    case HAL_ERROR:    return "error";
+    case HAL_BUSY:     return "busy";
+    case HAL_TIMEOUT:  return "timeout";
+    default:           return "?";
+    }
+}
+
+/* "No device" and "bus is stuck" look identical from the caller and
+ * need different fixes, so the peripheral's own flags go in the log:
+ * SR1 bit 10 = AF (NACK: nobody answered), bit 4 = ARB_LOST,
+ * bit 8 = BERR, bit 9 = OVR; SR2 bit 0 = BUSY (a line held low).
+ * The pad levels are the fastest pull-up test there is: both lines
+ * must read high whenever the bus is idle. */
+static void log_bus_state(bool after_failure)
+{
+    const uint32_t sr1 = s_i2c.Instance->SR1;
+    const uint32_t sr2 = s_i2c.Instance->SR2;
+
+    if (after_failure) {
+        LOGE("i2c:   hal=%s err=0x%x sr1=0x%04x sr2=0x%04x af=%u arb=%u berr=%u ovr=%u busy=%u",
+             status_name(s_last_status), (unsigned)HAL_I2C_GetError(&s_i2c),
+             (unsigned)sr1, (unsigned)sr2,
+             (unsigned)((sr1 & (1U << 10)) != 0U),
+             (unsigned)((sr1 & (1U << 4)) != 0U),
+             (unsigned)((sr1 & (1U << 8)) != 0U),
+             (unsigned)((sr1 & (1U << 9)) != 0U),
+             (unsigned)((sr2 & 1U) != 0U));
+    } else {
+        LOGI("i2c:   sr1=0x%04x sr2=0x%04x busy=%u",
+             (unsigned)sr1, (unsigned)sr2, (unsigned)((sr2 & 1U) != 0U));
+    }
+    LOGE("i2c:   pads scl=PB8:%u sda=PB9:%u",
+         (unsigned)(HAL_GPIO_ReadPin(BOARD_I2C_GPIO, BOARD_I2C_SCL_PIN) == GPIO_PIN_SET),
+         (unsigned)(HAL_GPIO_ReadPin(BOARD_I2C_GPIO, BOARD_I2C_SDA_PIN) == GPIO_PIN_SET));
+
+    if ((sr2 & 1U) != 0U) {
+        LOGE("i2c:   bus busy: a line is held low - missing pull-ups, a slave stuck mid-transfer, or SCL/SDA swapped");
+    } else if ((sr1 & (1U << 10)) != 0U) {
+        LOGE("i2c:   no ack at that address - wrong address, wrong bus, or the module is not powered");
+    }
+}
+
 static bool note_result(const char *what, uint8_t addr7, HAL_StatusTypeDef st)
 {
     if (st == HAL_OK) {
@@ -112,11 +159,13 @@ static bool note_result(const char *what, uint8_t addr7, HAL_StatusTypeDef st)
     }
 
     s_errors++;
+    s_last_status = st;
     if (s_streak < 1000U) {
         s_streak++;
     }
-    LOGE("%s @0x%02x failed (status=%d er=%lu)", what, addr7,
-         (int)st, s_errors);
+    LOGE("%s @0x%02x failed (status=%s er=%lu)", what, addr7,
+         status_name(st), s_errors);
+    log_bus_state(true);
 
     if (s_streak >= I2C_RECOVER_AFTER) {
         if (bus_recover()) {
@@ -206,6 +255,36 @@ uint32_t i2c_bus_error_count(void)
     return s_errors;
 }
 
+void i2c_bus_diag(const char *why)
+{
+    LOGI("i2c: diag (%s)", why);
+    log_bus_state(false);
+    LOGI("i2c:   failed transfers so far: %lu", (unsigned long)s_errors);
+}
+
+/* Which of the addresses this firmware expects actually ACK.  One line,
+ * so "the display is dead" and "the sensor is on the wrong bus" are
+ * visible without reading the whole scan. */
+static void report_expected(void)
+{
+    static const struct {
+        uint8_t addr;
+        const char *what;
+    } EXP[] = {
+        { SSD1306_I2C_ADDR7,   "oled"  },
+        { RTC_I2C_ADDR7,       "rtc"   },
+        { EEPROM_I2C_ADDR7,    "eeprom"},
+        { BME280_I2C_ADDR_LOW, "bme280?" },
+        { BME280_I2C_ADDR_HIGH, "bme280?" },
+    };
+
+    for (uint8_t i = 0U; i < (uint8_t)(sizeof(EXP) / sizeof(EXP[0])); i++) {
+        LOGI("i2c: expected %s at 0x%02x -> %s",
+             EXP[i].what, EXP[i].addr,
+             i2c_bus_present(EXP[i].addr) ? "ack" : "no ack");
+    }
+}
+
 void i2c_bus_scan(void)
 {
     uint8_t found = 0U;
@@ -216,7 +295,10 @@ void i2c_bus_scan(void)
             found++;
         }
     }
+    LOGI("i2c: scan done, %u slave(s) answered", (unsigned)found);
     if (found == 0U) {
-        LOGE("i2c: no slaves answered (wiring? pull-ups? VCC?)");
+        LOGE("i2c: no slaves answered - check 3V3/GND, pull-ups (4.7k..10k to 3V3), and that PB8=SCL / PB9=SDA are not swapped");
     }
+    report_expected();
+    i2c_bus_diag("after scan");
 }

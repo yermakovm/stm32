@@ -15,6 +15,7 @@
 #include "board.h"
 
 static UART_HandleTypeDef s_uart;
+static bool s_log_ready;
 
 /* ------------------------------------------------------------------ */
 /* minimal printf                                                      */
@@ -31,10 +32,15 @@ static size_t emit_uint(char *out, uint32_t v, unsigned base,
     if (base < 2U || base > 16U) {
         base = 10U;
     }
+    /* Stop when the value is exhausted, not when the scratch buffer is
+     * full: the old "while (n < sizeof(tmp))" condition turned every
+     * number into a 12-digit, zero-padded field (0x3C printed as
+     * 00000000003c, 400000 as 000000400000), which made the log almost
+     * unreadable and hid the two hex digits that actually matter. */
     do {
         tmp[n++] = digits[v % base];
         v /= base;
-    } while (n < sizeof(tmp));
+    } while (v != 0U && n < sizeof(tmp));
 
     size_t len = 0;
     for (unsigned pad = n; pad < min_width; pad++) {
@@ -171,6 +177,10 @@ void log_init(void)
     gpio.Alternate = BOARD_LOG_UART_AF;
     HAL_GPIO_Init(BOARD_LOG_UART_GPIO, &gpio);
 
+    /* From here on the peripheral exists, so a failure inside
+     * HAL_UART_Init below can still be reported. */
+    s_log_ready = true;
+
     s_uart.Instance = BOARD_LOG_UART;
     s_uart.Init.BaudRate = LOG_BAUDRATE;
     s_uart.Init.WordLength = UART_WORDLENGTH_8B;
@@ -182,14 +192,19 @@ void log_init(void)
     if (HAL_UART_Init(&s_uart) != HAL_OK) {
         board_fatal("HAL_UART_Init(USART1)");
     }
-
     /* Drop garbage left in the shift register by a hot plug-in. */
     (void)HAL_UART_AbortReceive(&s_uart);
 }
 
 void log_str(const char *s)
 {
-    size_t len = strnlen_lite(s, 128U);
+    size_t len;
+
+    if (!s_log_ready) {
+        return;   /* before log_init(): s_uart has no Instance yet */
+    }
+
+    len = strnlen_lite(s, 128U);
 
     if (HAL_UART_Transmit(&s_uart, (uint8_t *)s, (uint16_t)len,
                          LOG_TX_TIMEOUT_MS) != HAL_OK) {
@@ -199,14 +214,83 @@ void log_str(const char *s)
     }
 }
 
+/* One log call = one line. The format strings deliberately do not carry
+ * their own "\r\n"; without this every line ran straight into the next
+ * one ("... RH=49.29 %[I] sensor: T=21.4 ..."), which is what made the
+ * boot log unreadable here. Two bytes are held back from the formatter
+ * so the terminator always fits.
+ */
+static size_t terminate_line(char *buf, size_t n)
+{
+    if (n > 0U && buf[n - 1U] != '\n') {
+        if (buf[n - 1U] == '\r') {
+            buf[n++] = '\n';   /* a lone \r: only the \n is missing */
+        } else {
+            buf[n++] = '\r';
+            buf[n++] = '\n';
+        }
+    }
+    return n;
+}
+
+void log_hexdump(const char *label, const uint8_t *data, uint16_t len)
+{
+    char line[96];
+    uint16_t done = 0U;
+    size_t lab_len = 0U;
+
+    if (data == NULL || len == 0U) {
+        return;
+    }
+    if (label != NULL) {
+        lab_len = strnlen_lite(label, 24U);   /* room for offset + 16 bytes */
+    }
+
+    while (done < len) {
+        size_t n = 0U;
+        uint16_t chunk = (uint16_t)((len - done > 16U) ? 16U : (len - done));
+        uint16_t i;
+
+        memcpy(line + n, label, lab_len);
+        n += lab_len;
+        if (lab_len > 0U) {
+            line[n++] = '+';
+        }
+        /* "label+NN: aa bb ..." - the offset is printed so a 26-byte
+         * calibration block reads as two obvious lines. */
+        n += emit_uint(line + n, (uint32_t)done, 16U, 2U, true);
+        line[n++] = ':';
+        line[n++] = ' ';
+        for (i = 0U; i < chunk; i++) {
+            n += emit_uint(line + n, data[done + i], 16U, 2U, true);
+            line[n++] = ' ';
+        }
+        line[n++] = '\r';
+        line[n++] = '\n';
+        line[n] = '\0';
+
+        log_str(line);
+        done += chunk;
+    }
+}
+
 void log_printf(const char *fmt, ...)
 {
+    /* Two bytes are held back from the formatter so the line terminator
+     * always fits: no log call can end un-terminated. */
     char buf[128];
     va_list ap;
+    size_t n;
+
+    if (!s_log_ready) {
+        return;
+    }
 
     va_start(ap, fmt);
-    size_t n = vsnprintf_lite(buf, sizeof(buf), fmt, ap);
+    n = vsnprintf_lite(buf, sizeof(buf) - 2U, fmt, ap);
     va_end(ap);
+
+    n = terminate_line(buf, n);
 
     if (n > 0U) {
         (void)HAL_UART_Transmit(&s_uart, (uint8_t *)buf, (uint16_t)n,

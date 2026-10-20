@@ -33,13 +33,21 @@
 #define SSD1306_I2C_ADDR7         0x3CU    /* 0x3D if SA0 tied high  */
 #define RTC_I2C_ADDR7             0x68U    /* DS1307                 */
 #define EEPROM_I2C_ADDR7          0x50U    /* AT24C32 (A0..A2 = 0)   */
+/* BME280 is driven over SPI2 here, but the boot scan still probes the
+ * matching I2C addresses: if a module ACKs here while the SPI probe
+ * fails, the wiring and the driver disagree, and the log says so. */
+#define BME280_I2C_ADDR_LOW       0x76U    /* SDO tied low           */
+#define BME280_I2C_ADDR_HIGH      0x77U    /* SDO tied high          */
 
 /* ------------------------------------------------------------------ */
 /* BME280 temperature / pressure / humidity sensor                    */
 /* ------------------------------------------------------------------ */
 /* SPI2, not I2C: SPI1 (PA4..PA7) is routed to this board's onboard     */
 /* SPI flash footprint.  PB13=SCK, PB14=MISO, PB15=MOSI, PB12=CS.      */
-/* On the sensor: CSB to GND (SPI mode), SDA/SDI to 3V3.               */
+/* Sensor side (datasheet 5.2.4): CSB tied to GND = SPI mode (tied     */
+/* high = I2C mode), SDO -> PB14 (MISO), SDI -> PB15 (MOSI),           */
+/* SCK -> PB13.  A 4-pin module (VCC/GND/SCL/SDA only) has no CSB and  */
+/* cannot be driven from SPI at all.                                   */
 /* SCK = APB1 (42 MHz) / 2^prescaler: 4 -> 2.625 MHz, 5 -> 1.3125 MHz. */
 /* The chip allows 10 MHz; 1.3 MHz is chosen for jumper-wire margin.   */
 #define SPI_BUS_PRESCALER         5U

@@ -17,7 +17,12 @@
  *      rounds differently".
  *   4. The forced-mode handshake (trigger -> measuring -> data) works.
  *   5. A missing chip, or one with the wrong chip id, is handled without
- *      pretending to have data.
+ *      pretending to have data (including a BMP280, which is the part
+ *      usually sold as a "BME280").
+ *   6. The NVM-copy wait after a soft reset is timed, not counted: it
+ *      survives a slow copy and still gives up in bounded time.
+ *   7. bme280_diag() tells the same truth for a good chip and a missing
+ *      one.
  *
  * Build & run: tools/sensor_test/run.sh
  */
@@ -527,6 +532,68 @@ static void test_no_chip(void)
     fake_spi_set_chip_id(0x61U);
     CHECK(!bme280_init(), "init() accepted chip id 0x61");
     CHECK(!bme280_is_present(), "is_present() true for a foreign chip");
+
+    /* BMP280 (0x58) is the part most often sold as "BME280": it must be
+     * rejected, not silently read as if it had a humidity channel. */
+    fake_spi_reset();
+    load_calib_into_chip();
+    fake_spi_set_chip_id(0x58U);
+    CHECK(!bme280_init(), "init() accepted a BMP280 (id 0x58)");
+    CHECK(!bme280_is_present(), "is_present() true for a BMP280");
+}
+
+/* A soft reset starts the calibration-trim copy inside the chip, which
+ * runs while the bus is idle (datasheet: up to 1.5 ms).  The driver has
+ * to wait real time for it: the old counted loop of back-to-back status
+ * reads covered a fraction of a millisecond and reported "never
+ * finished its NVM copy" on a perfectly healthy part. */
+static void test_slow_nvm_copy(void)
+{
+    fake_spi_reset();
+    load_calib_into_chip();
+    fake_spi_set_im_update_reads(5);   /* 5 status reads still see im_update */
+
+    CHECK(bme280_init(),
+          "init() gave up while the NVM copy was still running");
+    CHECK(fake_spi_waits >= 5,
+          "init() waited only %d times for a copy that needs 5 polls",
+          fake_spi_waits);
+    CHECK(bme280_is_present(), "is_present() false after a slow but good init");
+    CHECK(fake_reset_cmd == 0xB6U, "slow-copy path skipped the soft reset: 0x%02x",
+          (unsigned)fake_reset_cmd);
+    CHECK(fake_spi_bad_cmds == 0, "%d SPI commands mis-framed during the NVM wait",
+          fake_spi_bad_cmds);
+
+    /* A chip whose copy never completes must fail in bounded time: the
+     * 10 s retry loop must never be able to stall the screen loop. */
+    fake_spi_reset();
+    load_calib_into_chip();
+    fake_spi_set_im_update_reads(10000);
+    CHECK(!bme280_init(),
+          "init() claimed success on a chip that never cleared im_update");
+    CHECK(fake_spi_waits >= 10 && fake_spi_waits <= 30,
+          "the NVM wait is not bounded: %d waits", fake_spi_waits);
+    CHECK(!bme280_is_present(), "is_present() true after a timed-out NVM copy");
+}
+
+/* The boot diagnostic has to be honest for a good chip and for a
+ * missing one: it is only useful if it never pretends and never hangs. */
+static void test_diag(void)
+{
+    fake_spi_reset();
+    load_calib_into_chip();
+    CHECK(bme280_init(), "diag fixture: init() failed");
+    bme280_diag();
+    CHECK(bme280_is_present(), "diag() changed the presence state");
+    CHECK(fake_spi_bad_cmds == 0, "%d diag reads were mis-framed",
+          fake_spi_bad_cmds);
+
+    fake_spi_reset();
+    load_calib_into_chip();
+    fake_spi_set_present(false);
+    CHECK(!bme280_init(), "diag fixture: init() claimed a missing chip");
+    bme280_diag();
+    CHECK(!bme280_is_present(), "diag() invented a chip that is not there");
 }
 
 int main(void)
@@ -536,6 +603,8 @@ int main(void)
     test_sweep();
     test_hot_sensor();
     test_no_chip();
+    test_slow_nvm_copy();
+    test_diag();
 
     printf("\n%d checks, %d failed\n", s_checks, s_fail);
     return (s_fail == 0) ? 0 : 1;

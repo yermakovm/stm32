@@ -1,7 +1,12 @@
 /**
  * @file    bme280.h
  * @brief   Bosch BME280 (temperature / pressure / relative humidity)
- *          driver for the shared I2C1 bus, I2C address 0x76 or 0x77.
+ *          driver on SPI2 (PB13 SCK, PB14 MISO, PB15 MOSI, PB12 CS).
+ *
+ * Not on the I2C bus: SPI1 (PA4..PA7) is taken by this board's onboard
+ * SPI flash footprint, so the sensor uses SPI2.  If a module is wired
+ * to I2C1 instead, this driver will not see it - see README
+ * "Troubleshooting".
  *
  * The chip is polled like the rest of this board: no interrupts, no DMA.
  * A measurement is started in FORCED mode and finished later, so a
@@ -17,7 +22,7 @@
  * formulas), so no float printf is pulled into the image.  Values:
  *   temperature  0.01 degC   (2344 = 23.44 C)
  *   pressure     0.01 Pa     (10132500 = 1013.25 hPa)
- *   humidity     0.001 %RH   (45123 = 45.123 %)
+ *   humidity     1/1024 %RH  (46080 = 45.0 %RH, Q10 fixed point)
  *
  * A missing or dead chip is not fatal: init() returns false, every
  * other call fails cheaply, and the clock keeps running.
@@ -36,13 +41,15 @@ typedef struct {
     uint32_t rh_x1024;     /* %RH * 1024 (Q10), 0..102400        */
 } bme280_data_t;
 
-/** Probe 0x76 then 0x77, check the chip id, soft reset, load the
- *  calibration trim, apply the oversampling/filter settings from
- *  app_config.h. @return false if no BME280 answered. */
+/** Probe the chip id (0xD0 = 0x60), soft reset, wait for the NVM trim
+ *  copy, load the calibration trim, apply the oversampling/filter
+ *  settings from app_config.h.  Logs which step failed and what the
+ *  bus actually returned.  @return false if no BME280 answered. */
 bool bme280_init(void);
 
-/** 7-bit address the chip answered on, 0 when it is not there. */
-uint8_t bme280_addr(void);
+/** Raw register dump + wiring verdict, for "is it connected at all?":
+ *  0xD0..0xD3, 0xF2..0xF5 and the first 8 calibration bytes. */
+void bme280_diag(void);
 
 /** True once bme280_init() has succeeded (and until it fails again). */
 bool bme280_is_present(void);
@@ -56,10 +63,10 @@ bool bme280_measure(void);
 /** True while the status register still reports "measuring". */
 bool bme280_is_measuring(void);
 
-/** Read the data registers and compensate. @return false on I2C error. */
+/** Read the data registers and compensate. @return false on SPI error. */
 bool bme280_read(bme280_data_t *out);
 
-/** Failed I2C transfers to this chip, for the log. */
+/** Failed SPI transfers to this chip, for the log. */
 uint32_t bme280_error_count(void);
 
 #endif /* BME280_H */

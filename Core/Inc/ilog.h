@@ -18,12 +18,22 @@
 /** Configure USART1 (PA9/PA10) and emit nothing yet. */
 void log_init(void);
 
-/** Blocking raw write of a NUL-terminated string. */
+/** Blocking raw write of a NUL-terminated string: sent exactly as
+ *  given, no line terminator added. Does nothing before log_init(). */
 void log_str(const char *s);
 
-/** Blocking formatted write. Supports %s %c %d %u %x %X plus
- *  %ld/%lu/%lx and width/zero-pad like %02u, %08lx. */
+/** Blocking formatted write. One call = one line: "\r\n" is appended
+ *  unless the text already ends with a newline, so no log line can run
+ *  into the next one. Lines longer than 126 characters are cut. Does
+ *  nothing before log_init().
+ *  Supports %s %c %d %u %x %X plus %ld/%lu/%lx and width/zero-pad like
+ *  %02u, %08lx. */
 void log_printf(const char *fmt, ...);
+
+/** Raw register/byte dump, 16 bytes per line: "label+off: aa bb ...".
+ *  For "is anything actually on the bus?" debugging, where the values
+ *  matter more than the meaning. */
+void log_hexdump(const char *label, const uint8_t *data, uint16_t len);
 
 #if LOG_LEVEL >= 0
 #define LOGE(...)            log_printf("[E] " __VA_ARGS__)

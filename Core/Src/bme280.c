@@ -75,6 +75,20 @@ static uint16_t osr_factor(uint8_t code)
 #define MEAS_DUR_US           2300U
 #define PRES_HUM_OFFSET_US    575U
 
+/* A soft reset starts the NVM copy of the calibration trim, which the
+ * datasheet gives as up to 1.5 ms.  One status read over SPI2 at
+ * 1.3 MHz takes ~25 us, so polling back-to-back covers a fraction of
+ * the copy time and reports "never finished" on a healthy chip: the
+ * wait has to be timed, not counted.  Bounded, because a broken chip
+ * must not stall the 33 ms screen loop. */
+#define NVM_POLL_MS             1U
+#define NVM_WAIT_MS            20U
+
+/* 0xD0 is the only presence test SPI has, so it is read a few times:
+ * a floating line or a half-made contact flickers, a real chip does
+ * not. */
+#define ID_PROBE_READS          3U
+
 /* ------------------------------------------------------------------ */
 /* calibration trim (datasheet 4.1.1)                                 */
 /* ------------------------------------------------------------------ */
@@ -305,25 +319,43 @@ static bool load_calib(void)
     return true;
 }
 
-/* Wait for the NVM trim copy after a soft reset. Each status read is a
- * ~0.1 ms I2C transaction, so a handful of them covers the 1.5 ms the
- * datasheet quotes without calling HAL_Delay(). */
+/* Wait for the NVM trim copy after a soft reset: timed, because the
+ * copy is a chip-internal process that runs while the bus is idle.
+ * Polling every NVM_POLL_MS for up to NVM_WAIT_MS covers the datasheet
+ * 1.5 ms with room for a slow part, and still cannot stall the boot -
+ * the old counted loop (24 back-to-back SPI reads, ~25 us each) did
+ * not even reach 1 ms and reported "never finished" on a healthy chip. */
 static bool wait_nvm_copy(void)
 {
     uint8_t st = 0U;
-    uint8_t tries = 24U;
+    uint32_t waited = 0U;
+    uint32_t polls = 0U;
 
-    while (tries > 0U) {
+    while (waited <= NVM_WAIT_MS) {
         if (!read_reg(REG_STATUS, &st, 1U)) {
+            LOGE("sensor: status read failed while waiting for the NVM copy (after %lu ms)",
+                 (unsigned long)waited);
             return false;
         }
+        polls++;
         if ((st & ST_IM_UPDATE) == 0U) {
+            LOGT("sensor: nvm copy done after %lu ms (%u polls, status=0x%02x)",
+                 (unsigned long)waited, (unsigned)polls, (unsigned)st);
             return true;
         }
-        tries--;
+        spi_bus_wait_ms(NVM_POLL_MS);
+        waited += NVM_POLL_MS;
     }
-    LOGE("sensor: BME280 never finished its NVM copy (status=0x%02x)",
-         (unsigned int)st);
+
+    /* im_update still 1 after 20 ms: the reset command must have
+     * arrived - it is what sets that bit - so CS/MOSI/MISO are alive.
+     * What is left is power, a chip held in reset, or an SPI clock the
+     * part cannot keep up with. */
+    LOGE("sensor: BME280 never finished its NVM copy: status=0x%02x (im_update=1) after %lu ms / %u polls",
+         (unsigned int)st, (unsigned long)waited, (unsigned)polls);
+    LOGE("sensor:   hints: 3V3+GND at the sensor, CSB tied to GND, SPI at or below 3 MHz (prescaler %u = %lu Hz)",
+         (unsigned)SPI_BUS_PRESCALER,
+         (unsigned long)(42000000U / (1U << SPI_BUS_PRESCALER)));
     return false;
 }
 
@@ -354,25 +386,159 @@ static bool apply_settings(void)
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* presence diagnostics                                               */
+/* ------------------------------------------------------------------ */
+
+/* On SPI there is no address to probe: the chip id is the whole
+ * presence test, and the value that comes back is itself the
+ * diagnosis. */
+static const char *id_verdict(uint8_t id)
+{
+    switch (id) {
+    case CHIP_ID_VALUE:
+        return "this is a BME280";
+    case 0x58U:
+        return "this is a BMP280: no humidity, different driver";
+    case 0x56U:
+        return "this is a BME680: different driver";
+    case 0x00U:
+        return "MISO reads low: sensor unpowered, PB14 not on sensor SDO, or CSB not tied to GND";
+    case 0xFFU:
+        return "MISO floats high: nothing drives it - CS (PB12) not reaching the sensor, CSB tied HIGH (that selects I2C mode), or MISO shorted to MOSI";
+    default:
+        return "not a BME280: wrong device, or the bits are shifted (swap MOSI/MISO, check CPOL/CPHA)";
+    }
+}
+
+/* Read 0xD0 ID_PROBE_READS times.  A real chip answers the same value
+ * every time; a floating line or a half-made contact does not.
+ * @return false only if the transfers themselves failed. */
+static bool probe_chip_id(uint8_t *out_id, uint8_t *out_agree)
+{
+    uint8_t v[ID_PROBE_READS];
+    uint8_t agree = 0U;
+    uint8_t i;
+
+    for (i = 0U; i < ID_PROBE_READS; i++) {
+        if (!read_reg(REG_ID, &v[i], 1U)) {
+            LOGE("sensor: chip id read %u of %u failed on SPI2 (spi errors %u)",
+                 (unsigned)(i + 1U), (unsigned)ID_PROBE_READS,
+                 (unsigned)s_errors);
+            *out_id = v[i];
+            *out_agree = 0U;
+            return false;
+        }
+        LOGT("sensor: chip id read %u -> 0x%02x", (unsigned)(i + 1U),
+             (unsigned)v[i]);
+    }
+
+    for (i = 0U; i < ID_PROBE_READS; i++) {
+        if (v[i] == v[ID_PROBE_READS - 1U]) {
+            agree++;
+        }
+    }
+    *out_id = v[ID_PROBE_READS - 1U];
+    *out_agree = agree;
+    return true;
+}
+
+/* Classify a block of raw register bytes: the difference between "no
+ * chip", "chip not selected" and "chip answering, contents wrong". */
+static const char *block_pattern(const uint8_t *p, uint16_t len)
+{
+    bool all_zero = true;
+    bool all_ff = true;
+    uint16_t i;
+
+    for (i = 0U; i < len; i++) {
+        if (p[i] != 0U) {
+            all_zero = false;
+        }
+        if (p[i] != 0xFFU) {
+            all_ff = false;
+        }
+    }
+    if (all_zero) {
+        return "all 0x00: MISO is held low - no power on the sensor, or SDO not wired to PB14";
+    }
+    if (all_ff) {
+        return "all 0xFF: MISO floats high - the chip is not being selected (CS), or it is in I2C mode";
+    }
+    return "mixed values: the bus is moving and the chip is answering";
+}
+
+void bme280_diag(void)
+{
+    uint8_t id4[4];
+    uint8_t ctl4[4];
+    uint8_t cal8[8];
+
+    LOGI("sensor: diag: raw reads over SPI2 (cs=PB12 sck=PB13 miso=PB14 mosi=PB15)");
+
+    if (read_reg(REG_ID, id4, 4U)) {
+        log_hexdump("id d0..d3", id4, 4U);
+        LOGI("sensor:   id block: %s", block_pattern(id4, 4U));
+    } else {
+        LOGE("sensor:   0xD0 read failed - no transfer at all");
+    }
+    /* 0xF2..0xF5 = ctrl_hum, status, ctrl_meas, config.  status bit 0
+     * (im_update) still set means the chip never applied its settings;
+     * status bit 3 stuck means it is measuring forever. */
+    if (read_reg(REG_CTRL_HUM, ctl4, 4U)) {
+        log_hexdump("ctl f2..f5", ctl4, 4U);
+        LOGI("sensor:   status 0x%02x: im_update=%u measuring=%u",
+             (unsigned)ctl4[1],
+             (unsigned)((ctl4[1] & ST_IM_UPDATE) != 0U),
+             (unsigned)((ctl4[1] & ST_MEASURING) != 0U));
+    } else {
+        LOGE("sensor:   0xF2 read failed - no transfer at all");
+    }
+    /* A genuine BME280 trim is never all zero: dig_T1 is a few hundred
+     * and dig_P1 is around 36000. */
+    if (read_reg(REG_CALIB_TP, cal8, 8U)) {
+        log_hexdump("trim 88..8f", cal8, 8U);
+        LOGI("sensor:   trim: %s", block_pattern(cal8, 8U));
+    } else {
+        LOGE("sensor:   0x88 read failed - no transfer at all");
+    }
+}
+
 bool bme280_init(void)
 {
     uint8_t id = 0U;
+    uint8_t agree = 0U;
 
     s_ready = false;
 
-    /* No address to probe on SPI: the chip id is the presence test.  A
-     * sensor that is not wired answers 0x00 (MISO pulled down) or 0xFF
-     * (pulled up), never 0x60. */
-    if (!read_reg(REG_ID, &id, 1U) || id != CHIP_ID_VALUE) {
-        LOGI("sensor: no BME280 on SPI2 (chip id 0x%02x, expected 0x60)",
-             (unsigned int)id);
+    if (!probe_chip_id(&id, &agree)) {
+        LOGE("sensor: SPI2 got no answer at all - check 3V3/GND and PB12..PB15 (cs/sck/miso/mosi)");
+        return false;
+    }
+    if (agree != ID_PROBE_READS) {
+        LOGE("sensor: chip id is not stable (%u of %u reads agreed on 0x%02x) - suspect a flaky contact or a floating line",
+             (unsigned)agree, (unsigned)ID_PROBE_READS, (unsigned)id);
+    }
+    if (id != CHIP_ID_VALUE) {
+        LOGE("sensor: no BME280 on SPI2: chip id 0x%02x, expected 0x60 - %s",
+             (unsigned int)id, id_verdict(id));
         return false;
     }
 
-    if (!write_reg(REG_RESET, RESET_CMD) || !wait_nvm_copy()) {
+    if (!write_reg(REG_RESET, RESET_CMD)) {
+        LOGE("sensor: init stopped at soft reset (0xE0 = 0xB6)");
         return false;
     }
-    if (!load_calib() || !apply_settings()) {
+    if (!wait_nvm_copy()) {
+        LOGE("sensor: init stopped at the NVM copy wait");
+        return false;
+    }
+    if (!load_calib()) {
+        LOGE("sensor: init stopped at the calibration read (0x88..0xA1, 0xE1..0xE7)");
+        return false;
+    }
+    if (!apply_settings()) {
+        LOGE("sensor: init stopped at the settings write (0xF2, 0xF5, 0xF4)");
         return false;
     }
 

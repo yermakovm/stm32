@@ -43,6 +43,11 @@ bool i2c_bus_present(uint8_t addr7);
 /** Consecutive/total failed transfers, for the log + diagnostics. */
 uint32_t i2c_bus_error_count(void);
 
+/** Log the pad levels, SR1/SR2 and the error count: "no pull-ups",
+ *  "no ack" and "bus locked by a slave" are different faults and this
+ *  is what tells them apart. */
+void i2c_bus_diag(const char *why);
+
 /** Dump which addresses answer, called once at boot. */
 void i2c_bus_scan(void);
 

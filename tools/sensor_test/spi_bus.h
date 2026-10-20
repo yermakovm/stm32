@@ -15,6 +15,8 @@
 bool spi_bus_init(void);
 void spi_bus_cs(bool asserted);
 bool spi_bus_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len);
+void spi_bus_wait_ms(uint32_t ms);
+void spi_bus_diag(const char *why);
 bool spi_bus_is_ready(void);
 uint32_t spi_bus_error_count(void);
 

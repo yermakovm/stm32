@@ -163,6 +163,14 @@ stops answering, the driver reports failure, the row shows
 `T:--.-°C RH:--% P:----hPa`, and the next probe happens after
 `SENSOR_RETRY_MS` (10 s) instead of every frame.
 
+The NVM-copy wait after the soft reset is **timed, not counted**: the
+copy runs inside the chip while the bus is idle (datasheet: up to 1.5
+ms), one status read over SPI2 at 1.3 MHz is ~25 µs, so a counted loop
+of back-to-back reads gives up long before the copy is over. The driver
+polls every 1 ms for at most 20 ms (`NVM_POLL_MS` / `NVM_WAIT_MS`), which
+is generous enough for a slow part and short enough that a dead one can
+never stall the 33 ms screen loop.
+
 ### 5.3 Compensation and units
 
 `bme280.c` uses Bosch's integer (fixed-point) formulas — no floats, no
@@ -216,13 +224,17 @@ and hide the row.
 tools/sensor_test/run.sh   # compiles bme280.c against an emulated SPI slave
 ```
 
-It checks: probe + chip id, soft reset `0xE0 = 0xB6` and the NVM-copy
-wait, that `ctrl_hum` is written before `ctrl_meas`, register-block
+It checks: probe + chip id (3 reads, and the verdict for a wrong id),
+soft reset `0xE0 = 0xB6` and the **timed** NVM-copy wait (a slow copy
+must succeed, a chip that never clears `im_update` must fail in bounded
+time), that `ctrl_hum` is written before `ctrl_meas`, register-block
 parsing (`0x88..0xA1`, `0xE1..0xE7`, the packed `dig_H4/H5` nibbles),
 SPI command framing and CS usage, the forced-mode busy handshake, that
-a missing or foreign chip is handled, and a 512-point sweep comparing
-the integer compensation against Bosch's double-precision formulas
-(worst deviation in the current run: 0.005 °C, 0.02 Pa, 0.005 %RH).
+a missing or foreign chip is handled (a BMP280 included - it is the part
+usually sold as a "BME280"), that `bme280_diag()` tells the same truth
+for a good chip and a missing one, and a 512-point sweep comparing the
+integer compensation against Bosch's double-precision formulas
+(worst deviation in the current run: 0.005 °C, 0.02 Pa, 0.0053 %RH).
 It also sweeps 30..70 °C to prove the temperature output stays
 monotonic and inside the datasheet range.
 
@@ -378,6 +390,46 @@ Key take-aways:
 - The charge pump (`0x8D 0x14`) must be enabled **before** `0xAF`,
   with the 100 ms settle gap between chunks A and B; the SPI-only
   `0x32` regulator command does not apply over I2C.
+
+## 8. Troubleshooting the log
+
+`boot()` prints enough to separate the three different kinds of "it is
+not connected" without a scope: dead bus, chip not selected, chip
+answering but unhappy.
+
+### 8.1 Reading the boot lines
+
+| Log line | Meaning | Next step |
+|---|---|---|
+| `i2c: found device at 0x3c` | that address ACKs | - |
+| `i2c: expected oled at 0x3c -> no ack` | a module this firmware expects is missing | address, power, PB8/PB9 |
+| `i2c: ... sr2=0x0001 busy=1` | a line is held low | pull-ups (4.7k..10k to 3V3), SCL/SDA swap, bus recovery |
+| `i2c: ... sr1=0x... af=1` | NACK - nobody answered | wrong address, or the module is unpowered |
+| `spi: SPI2 up, sck=1312500 Hz (prescaler 5), cs=PB12` | peripheral is alive | - |
+| `spi: diag ... pads cs=PB12:1 sck=PB13:0 miso=PB14:1 mosi=PB15:1` | idle levels: CS high, SCK low in mode 0 | a `0` on CS or MISO is a wiring problem |
+| `spi: ... mode fault ...` | SCK is being driven from outside | pin conflict |
+| `sensor: no BME280 on SPI2: chip id 0x00` | MISO held low | sensor unpowered, PB14 not on SDO, or CSB not tied to GND |
+| `sensor: ... chip id 0xff` | MISO floating / chip not selected | CS not reaching the chip, CSB tied HIGH (**that selects I2C mode**), or MISO shorted to MOSI |
+| `sensor: ... chip id 0x58` | it is a **BMP280** | no humidity channel, different driver |
+| `sensor: SPI2 got no answer at all` | the transfer itself failed | SPI init, pins, clock |
+| `sensor: chip id is not stable (2 of 3 reads agreed...)` | flaky contact / floating line | reseat the jumper wires |
+| `sensor: BME280 never finished its NVM copy: status=0x01 ... after 21 ms / 21 polls` | the reset landed (the reset is what sets that bit), but the chip never applied it | power brown-out, chip held in reset, SPI clock too fast |
+| `sensor: a chip ACKs on I2C1 0x76/0x77 while this driver talks SPI2` | the module is wired for I2C | rewire to PB12..PB15 with **CSB to GND**, or move the driver to I2C1 |
+
+### 8.2 Cause -> signature
+
+* **No power / no ground at the sensor** -> `chip id 0x00`,
+  `id block: all 0x00`.
+* **CSB tied high** (the chip is in I2C mode) -> `chip id 0xff`, plus the
+  I2C cross-check line if the module also hangs off I2C1.
+* **MISO and MOSI swapped** -> `0xff` or a shifted value, never `0x60`.
+* **Chip fine, driver too impatient** -> used to report `never finished
+  its NVM copy` after ~0.6 ms of back-to-back status reads; with the
+  timed wait that line now only appears when the chip is really stuck.
+
+`bme280_diag()` runs automatically after a failed probe and prints the
+raw bytes: `id d0..d3: 60 00 00 00` plus a non-zero `trim 88..8f` means
+the bus works and a real BME280 is answering.
 
 ## Build
 
