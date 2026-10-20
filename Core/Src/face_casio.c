@@ -2,13 +2,20 @@
  * @file    face_casio.c
  * @see     face_casio.h
  *
- * Screen plan (128x32; the 128x64 variant uses the same rows, scaled):
+ * Screen plan (128x32, UI_SHOW_SENSOR=1; the 128x64 variant uses the
+ * same bands, just lower and with taller digits):
  *
- *   +------------------------------+   <- bezel
- *   | MON 04.09.2026              |   <- weekday + date
- *   |                             |   |   <- blank gutter above the
- *   |     [0][9]:[4][1]:[2][3]    |   <- hours:minutes bold, sec fine
- *   +------------------------------+
+ *   +------------------------------+   <- bezel (row 0)
+ *   | MON 04.09.2026              |   <- weekday + date, 5x7  (1..7)
+ *   |  T:23.4°C RH:45% P:1013hPa  |   <- BME280 line, 4x6     (9..14)
+ *   |                             |   <- gutter              (15)
+ *   |   [0][9]:[4][1]:[2][3]     |   <- hours:minutes 15px, sec fine
+ *   +------------------------------+                              (31)
+ *
+ * The sensor line needs the 4x6 font: 25 characters x 6 px (5x7) would
+ * be 150 px on a 128 px panel, at 5 px/char it is 125 px.  In exchange
+ * the big digits lose 5 rows (20 -> 15).  With UI_SHOW_SENSOR=0 the
+ * original 20 px digits come back and the row disappears.
  *
  * Only the regions drawn here are pushed to the panel, so a frame
  * costs a couple of I2C page writes instead of the whole framebuffer.
@@ -40,6 +47,7 @@ typedef struct {
 
 typedef struct {
     int16_t date_y;
+    int16_t sensor_y;   /* 0 -> no sensor row at all            */
     int16_t clock_y;
     uint16_t clock_h;
     seg7_geom_t digit;
@@ -90,13 +98,128 @@ static void build_date(char dst[15], const ds1307_time_t *t)
     dst[14] = '\0';
 }
 
+/* Append a decimal number, no leading zeros. @return the new end. */
+static char *append_u(char *dst, uint32_t v)
+{
+    char tmp[10];
+    uint8_t n = 0;
+
+    do {
+        tmp[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    } while (v > 0U);
+    while (n > 0U) {
+        *dst++ = tmp[--n];
+    }
+    return dst;
+}
+
+/* The BME280 line, fixed point -> text, no snprintf and no floats:
+ *
+ *   valid:   "T:23.4°C RH:45% P:1013hPa"
+ *   missing: "T:--.-°C RH:--% P:----hPa"
+ *
+ * 25 characters x 5 px = 125 px fits the 128 px panel.  The widest
+ * reading the sensor can legally produce (-40.0°C, 100 %RH, four-digit
+ * pressure) is 27 characters = 135 px, so the caller falls back to
+ * @p compact = true, which drops the two field separators. */
+void face_build_sensor(char *dst, const bme280_data_t *env, bool valid,
+                       bool compact)
+{
+    char *p = dst;
+
+    *p++ = 'T';
+    *p++ = ':';
+    if (valid && env != NULL) {
+        const int32_t t = env->temp_c_x100;
+        const bool neg = t < 0;
+        const uint32_t u = neg ? (uint32_t)(-t) : (uint32_t)t;
+        const uint32_t t10 = (u + 5U) / 10U;    /* 0.1 degC units */
+
+        if (neg) {
+            *p++ = '-';
+        }
+        p = append_u(p, t10 / 10U);
+        *p++ = '.';
+        *p++ = (char)('0' + (t10 % 10U));
+    } else {
+        memcpy(p, "--.-", 4U);
+        p += 4U;
+    }
+    *p++ = CH_DEGREE;
+    *p++ = 'C';
+
+    if (!compact) {
+        *p++ = ' ';
+    }
+    memcpy(p, "RH:", 3U);
+    p += 3U;
+    if (valid && env != NULL) {
+        p = append_u(p, (env->rh_x1024 + 512U) / 1024U);    /* whole %RH */
+    } else {
+        *p++ = '-';
+        *p++ = '-';
+    }
+    *p++ = '%';
+
+    if (!compact) {
+        *p++ = ' ';
+    }
+    memcpy(p, "P:", 2U);
+    p += 2U;
+    if (valid && env != NULL) {
+        /* Pa*100 -> whole hPa, rounded. */
+        p = append_u(p, (env->press_pa_x100 + 5000U) / 10000U);
+    } else {
+        memcpy(p, "----", 4U);
+        p += 4U;
+    }
+    memcpy(p, "hPa", 3U);
+    p += 3U;
+    *p = '\0';
+}
+
+static void draw_sensor(const bme280_data_t *env, bool env_valid)
+{
+    char line[32];
+    uint16_t w;
+
+    if (s_layout.sensor_y <= 0) {
+        return;
+    }
+
+    face_build_sensor(line, env, env_valid, false);
+    if (gfx_text_width(line, FONT_MINI) + 2U > OLED_WIDTH) {
+        face_build_sensor(line, env, env_valid, true);
+    }
+
+    w = gfx_text_width(line, FONT_MINI);
+    gfx_fill_rect(1, s_layout.sensor_y, (uint16_t)(OLED_WIDTH - 2U),
+                  gfx_font_height(FONT_MINI), false);
+    gfx_text((int16_t)((OLED_WIDTH - w) / 2U), s_layout.sensor_y, line,
+             FONT_MINI);
+}
+
 /* ------------------------------------------------------------------ */
 /* layout + cells                                                      */
 /* ------------------------------------------------------------------ */
 
 static void setup_layout(void)
 {
+    s_layout.sensor_y = 0;
+
     if (OLED_HEIGHT == 32U) {
+#if UI_SHOW_SENSOR
+        /* Rows 1..7 date, 9..14 sensor, 15 gutter, 16..30 digits,
+         * row 0 and 31 are the bezel. The digits shrink 20 -> 15 px to
+         * make room for the 6-row sensor line. */
+        s_layout.date_y = 1;
+        s_layout.sensor_y = 9;
+        s_layout.clock_y = 16;
+        s_layout.clock_h = 15;
+        s_layout.digit = (seg7_geom_t){ 10, 15, 2 };
+        s_layout.colon_w = 6;
+#else
         /* Rows 2..7 date, rows 8..9 gutter, rows 10..29 digits,
          * row 30 blank, row 31 bezel. */
         s_layout.date_y = 2;
@@ -104,12 +227,16 @@ static void setup_layout(void)
         s_layout.clock_h = 20;
         s_layout.digit = (seg7_geom_t){ 14, 20, 3 };
         s_layout.colon_w = 6;
+#endif
     } else {
         s_layout.date_y = 3;
         s_layout.clock_y = 22;
         s_layout.clock_h = 30;
         s_layout.digit = (seg7_geom_t){ 20, 30, 4 };
         s_layout.colon_w = 12;
+#if UI_SHOW_SENSOR
+        s_layout.sensor_y = 54;   /* 54..59, bezel stays at 63 */
+#endif
     }
 }
 
@@ -257,7 +384,8 @@ static void update_cells(const char time_str[9], uint32_t now_ms)
     }
 }
 
-void face_draw(const ds1307_time_t *t, bool time_valid, uint32_t now_ms)
+void face_draw(const ds1307_time_t *t, bool time_valid, uint32_t now_ms,
+               const bme280_data_t *env, bool env_valid)
 {
     char time_str[9];
     char date_str[15];
@@ -275,6 +403,9 @@ void face_draw(const ds1307_time_t *t, bool time_valid, uint32_t now_ms)
     /* Header row: weekday + date. */
     gfx_fill_rect(2, s_layout.date_y, (uint16_t)(OLED_WIDTH - 4), 7, false);
     gfx_text(3, s_layout.date_y, date_str, FONT_NORMAL);
+
+    /* Sensor row: temperature, relative humidity, pressure. */
+    draw_sensor(env, env_valid);
 
     /* Clock row. */
     for (uint8_t i = 0U; i < 8U; i++) {

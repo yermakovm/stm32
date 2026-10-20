@@ -11,6 +11,7 @@
 
 #include <string.h>
 
+#include "font4x6.h"
 #include "font5x7.h"
 #include "ssd1306.h"
 
@@ -100,25 +101,54 @@ void gfx_bitmap_clip(const gfx_clip_t *clip, int16_t x, int16_t y,
     }
 }
 
+/* Which table + size a font means: everything else in this file is
+ * shared by both fonts. */
+static const uint8_t *glyph_for(char ch, gfx_font_t font, uint8_t *w,
+                                uint8_t *h)
+{
+    if (font == FONT_MINI) {
+        *w = FONT4X6_WIDTH;
+        *h = FONT4X6_HEIGHT;
+        return font4x6_glyph(ch);
+    }
+    *w = FONT5X7_WIDTH;
+    *h = FONT5X7_HEIGHT;
+    return font5x7_glyph(ch);
+}
+
 uint16_t gfx_char_width(gfx_font_t font)
 {
     /* Bold is the same 5x7 bitmap with every stroke widened by one
      * pixel (right and down), hence one pixel more per character. */
+    if (font == FONT_MINI) {
+        return (uint16_t)(FONT4X6_WIDTH + 1U);
+    }
     return (font == FONT_BOLD) ? (uint16_t)(FONT5X7_WIDTH + 2U)
                                : (uint16_t)(FONT5X7_WIDTH + 1U);
+}
+
+uint8_t gfx_font_height(gfx_font_t font)
+{
+    /* Bold draws a shifted copy one row lower, so it needs one row more. */
+    if (font == FONT_MINI) {
+        return FONT4X6_HEIGHT;
+    }
+    return (uint8_t)((font == FONT_BOLD) ? (FONT5X7_HEIGHT + 1) : FONT5X7_HEIGHT);
 }
 
 void gfx_char_clip(const gfx_clip_t *clip, int16_t x, int16_t y,
                    char ch, gfx_font_t font, bool on)
 {
-    const uint8_t *cols = font5x7_glyph(ch);
+    uint8_t w;
+    uint8_t h;
+    const uint8_t *cols = glyph_for(ch, font, &w, &h);
 
     if (cols == NULL) {
         return;
     }
 
-    for (uint8_t c = 0U; c < FONT5X7_WIDTH; c++) {
-        for (uint8_t r = 0U; r < FONT5X7_HEIGHT; r++) {
+    for (uint8_t c = 0U; c < w; c++) {
+        for (uint8_t r = 0U; r < h; r++) {
             if ((cols[c] & (uint8_t)(1U << r)) != 0U) {
                 /* Draw the glyph plus a shifted copy: both weights end
                  * up the same advance width, but bold has 2 px thick

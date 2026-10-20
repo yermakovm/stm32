@@ -39,11 +39,14 @@ C_SOURCES =  \
 Core/Src/main.c \
 Core/Src/board.c \
 Core/Src/i2c_bus.c \
+Core/Src/spi_bus.c \
 Core/Src/ilog.c \
 Core/Src/ds1307.c \
 Core/Src/at24.c \
+Core/Src/bme280.c \
 Core/Src/ssd1306.c \
 Core/Src/font5x7.c \
+Core/Src/font4x6.c \
 Core/Src/gfx.c \
 Core/Src/seg7.c \
 Core/Src/face_casio.c \
@@ -51,6 +54,7 @@ Core/Src/stm32f4xx_it.c \
 Core/Src/stm32f4xx_hal_msp.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_uart.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_i2c.c \
+Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_spi.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc_ex.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_flash.c \

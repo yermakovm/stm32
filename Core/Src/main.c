@@ -4,21 +4,24 @@
  *   STM32F401CEU6
  *     USART1 PA9/PA10 @115200 -> USB-TTL for the log
  *     I2C1 PB8 (SCL) / PB9 (SDA) -> SSD1306 0x3C, DS1307 0x68,
- *                                    AT24C32 0x50
+ *                                    AT24C32 0x50, BME280 0x76/0x77
  *
  * Nothing else is attached: no button, no ESP32 link, no status LED.
  * The screen is refreshed once per second (plus one animated frame
- * every UI_FRAME_MS so the roll/spinner look smooth).
+ * every UI_FRAME_MS so the roll/spinner look smooth) and the BME280 is
+ * sampled twice a second, with the same numbers on the log channel.
  */
 
 #include <string.h>
 
 #include "at24.h"
 #include "board.h"
+#include "bme280.h"
 #include "ds1307.h"
 #include "face_casio.h"
 #include "gfx.h"
 #include "i2c_bus.h"
+#include "spi_bus.h"
 #include "ilog.h"
 #include "ssd1306.h"
 
@@ -35,6 +38,28 @@ static uint32_t s_last_backup_min = 0xFFFFFFFFU;
  * the face keeps counting from here instead of freezing. */
 static ds1307_time_t s_seed;
 static uint32_t s_seed_ms;
+
+/* ------------------------------------------------------------------ */
+/* BME280 sampling state                                               */
+/* ------------------------------------------------------------------ */
+
+/* A forced-mode cycle is ~46 ms, far longer than one 33 ms UI frame,
+ * so the measurement is split across loop passes instead of blocking:
+ * trigger -> (screen keeps animating) -> read when the chip says it is
+ * done. SENSOR_PERIOD_MS is the gap between two triggers. */
+typedef enum {
+    SENSOR_ARMED,     /* nothing running, wait for the next period */
+    SENSOR_RUNNING,   /* triggered, waiting for the conversion     */
+    SENSOR_FETCH      /* conversion over, data registers pending   */
+} sensor_state_t;
+
+static bme280_data_t s_env;
+static bool s_env_valid;
+static sensor_state_t s_sensor_state = SENSOR_ARMED;
+static uint32_t s_last_sample_ms;      /* when the last sample landed */
+static uint32_t s_trigger_ms;          /* when the forced cycle started */
+static uint32_t s_next_sensor_retry;
+static uint32_t s_next_sensor_log;
 
 /* ------------------------------------------------------------------ */
 /* time seeding                                                        */
@@ -324,6 +349,112 @@ static void acquire_time(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* BME280: sampling + log line                                         */
+/* ------------------------------------------------------------------ */
+
+/* One info line per accepted sample on the existing USART1 channel, in
+ * the same order the screen shows it. Fixed point -> printed as
+ * integer + decimals, no float formatting anywhere. */
+static void sensor_log(void)
+{
+    const int32_t t = s_env.temp_c_x100;
+    const bool tneg = t < 0;
+    const uint32_t u = tneg ? (uint32_t)(-t) : (uint32_t)t;
+    const uint32_t t10 = (u + 5U) / 10U;        /* 0.1 degC   */
+    const uint32_t rh10 = (s_env.rh_x1024 * 10U + 512U) / 1024U;  /* 0.1 %RH */
+    const uint32_t p10 = (s_env.press_pa_x100 + 500U) / 1000U; /* 0.1 hPa */
+
+    LOGI("sensor: T=%s%u.%u C RH=%u.%u%% P=%u.%u hPa",
+         tneg ? "-" : "",
+         (unsigned)(t10 / 10U), (unsigned)(t10 % 10U),
+         (unsigned)(rh10 / 10U), (unsigned)(rh10 % 10U),
+         (unsigned)(p10 / 10U), (unsigned)(p10 % 10U));
+}
+
+/* Advance the sensor state machine by one superloop pass. */
+static void sensor_update(uint32_t now)
+{
+    if (!bme280_is_present()) {
+        if ((int32_t)(now - s_next_sensor_retry) >= 0) {
+            s_next_sensor_retry = now + SENSOR_RETRY_MS;
+            if (bme280_init()) {
+                s_sensor_state = SENSOR_ARMED;
+                s_last_sample_ms = now - SENSOR_PERIOD_MS;
+            } else {
+                s_env_valid = false;
+            }
+        }
+        return;
+    }
+
+    switch (s_sensor_state) {
+    case SENSOR_ARMED:
+        if ((int32_t)(now - s_last_sample_ms) >= SENSOR_PERIOD_MS) {
+            if (bme280_measure()) {
+                s_trigger_ms = now;
+                s_sensor_state = SENSOR_RUNNING;
+            } else {
+                s_last_sample_ms = now;   /* back off, do not hammer */
+            }
+        }
+        break;
+
+    case SENSOR_RUNNING:
+        /* Asking before the chip's own cycle time only burns bus time;
+         * the measuring bit is what actually says "data is there". */
+        if ((int32_t)(now - s_trigger_ms) < (int32_t)bme280_meas_time_ms()) {
+            break;
+        }
+        if (bme280_is_measuring()) {
+            if ((int32_t)(now - s_trigger_ms) > SENSOR_TIMEOUT_MS) {
+                LOGE("sensor: conversion did not finish in %u ms",
+                     (unsigned)SENSOR_TIMEOUT_MS);
+                s_sensor_state = SENSOR_ARMED;
+                s_last_sample_ms = now;
+            }
+            break;
+        }
+        s_sensor_state = SENSOR_FETCH;
+        /* fall through */
+
+    case SENSOR_FETCH:
+        if (bme280_read(&s_env)) {
+            s_env_valid = true;
+            s_last_sample_ms = board_ms();
+            if (SENSOR_LOG_PERIOD_MS != 0U
+                && (int32_t)(now - s_next_sensor_log) >= 0) {
+                s_next_sensor_log = now + SENSOR_LOG_PERIOD_MS;
+                sensor_log();
+            }
+        } else {
+            s_last_sample_ms = now;   /* try again after a full period */
+        }
+        s_sensor_state = SENSOR_ARMED;
+        break;
+    }
+}
+
+/* One synchronous sample at boot, so the very first frame already shows
+ * real numbers instead of dashes. Blocks for about one cycle time. */
+static void sensor_first(void)
+{
+    if (!bme280_measure()) {
+        return;
+    }
+    for (uint32_t waited = 0U; waited < SENSOR_TIMEOUT_MS; waited += 5U) {
+        if (!bme280_is_measuring()) {
+            break;
+        }
+        HAL_Delay(5);
+    }
+    if (bme280_read(&s_env)) {
+        s_env_valid = true;
+        s_last_sample_ms = board_ms();
+        sensor_log();
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* boot + main loop                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -339,6 +470,16 @@ static void boot(void)
     acquire_time();
     log_clock_state("boot");
 
+    if (!spi_bus_init()) {
+        board_fatal("spi_bus_init");
+    }
+
+    if (bme280_init()) {
+        sensor_first();
+    } else {
+        LOGI("sensor: no BME280 on SPI2, the sensor row stays empty");
+    }
+
     if (!ssd1306_init()) {
         LOGE("display: no SSD1306 at 0x%02x - showing nothing",
              SSD1306_I2C_ADDR7);
@@ -346,7 +487,7 @@ static void boot(void)
     face_init();
 
     /* Push the very first frame even if the time came from the seed. */
-    face_draw(&s_time, s_time_valid, board_ms());
+    face_draw(&s_time, s_time_valid, board_ms(), &s_env, s_env_valid);
     if (!ssd1306_flush()) {
         LOGE("display: first frame never made it to the panel");
     }
@@ -359,11 +500,13 @@ int main(void)
 
     board_init();
     log_init();
-    log_str("\r\n===== STM32F401 + DS1307 + SSD1306 =====\r\n");
+    log_str("\r\n===== STM32F401 + DS1307 + SSD1306 + BME280 =====\r\n");
     boot();
 
     next_frame = board_ms() + UI_FRAME_MS;
     next_screen_try = board_ms() + SCREEN_RETRY_MS;
+    s_next_sensor_retry = board_ms() + SENSOR_RETRY_MS;
+    s_next_sensor_log = board_ms();
     for (;;) {
         uint32_t now = board_ms();
 
@@ -374,8 +517,11 @@ int main(void)
             acquire_time();
         }
 
+        /* Two sensor updates per second, spread over the UI frames. */
+        sensor_update(now);
+
         if (ssd1306_is_alive()) {
-            face_draw(&s_time, s_time_valid, now);
+            face_draw(&s_time, s_time_valid, now, &s_env, s_env_valid);
             if (!ssd1306_flush()) {
                 LOGE("display: refresh failed, retrying in %u ms",
                      (unsigned)SCREEN_RETRY_MS);

@@ -77,8 +77,14 @@ ART = {
     "|": "..#..\n..#..\n..#..\n..#..\n..#..\n..#..\n..#..",
 }
 
+# "degree" is not ASCII, so it lives in the free slot right after '~' and
+# is emitted as code 0x7F (see CH_DEGREE in gfx.h). Used by the sensor
+# row ("23.4°C") and by font4x6 as well.
+DEGREE = 0x7F
+ART_DEGREE = ".##..\n#..#.\n.##..\n.....\n.....\n.....\n....."
+
 FIRST = 0x20
-LAST = 0x7E
+LAST = 0x7F
 GLYPH_W = 5
 GLYPH_H = 7
 
@@ -108,8 +114,12 @@ def main() -> None:
         "static const uint8_t FONT5X7[FONT5X7_GLYPH_COUNT][FONT5X7_WIDTH] = {",
     ]
     for code in range(FIRST, LAST + 1):
-        art = ART.get(chr(code), ART[" "])
-        label = repr(chr(code)).replace("'", "")
+        if code == DEGREE:
+            art = ART_DEGREE
+            label = "deg"
+        else:
+            art = ART.get(chr(code), ART[" "])
+            label = repr(chr(code)).replace("'", "")
         data = ", ".join(f"0x{b:02X}" for b in pack(art))
         out.append(f"    {{{data}}},  /* {label} */")
     out += [

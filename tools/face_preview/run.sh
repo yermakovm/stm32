@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")/../.."
 mkdir -p build/face_preview
 cc -std=c11 -Wall -Wextra -I Core/Inc -I tools/face_preview \
-   Core/Src/gfx.c Core/Src/font5x7.c Core/Src/seg7.c Core/Src/face_casio.c \
+   Core/Src/gfx.c Core/Src/font5x7.c Core/Src/font4x6.c Core/Src/seg7.c Core/Src/face_casio.c \
    tools/face_preview/fake_display.c tools/face_preview/render.c \
    -o build/face_preview/render
 exec build/face_preview/render

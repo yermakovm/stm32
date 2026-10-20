@@ -35,6 +35,38 @@
 #define EEPROM_I2C_ADDR7          0x50U    /* AT24C32 (A0..A2 = 0)   */
 
 /* ------------------------------------------------------------------ */
+/* BME280 temperature / pressure / humidity sensor                    */
+/* ------------------------------------------------------------------ */
+/* SPI2, not I2C: SPI1 (PA4..PA7) is routed to this board's onboard     */
+/* SPI flash footprint.  PB13=SCK, PB14=MISO, PB15=MOSI, PB12=CS.      */
+/* On the sensor: CSB to GND (SPI mode), SDA/SDI to 3V3.               */
+/* SCK = APB1 (42 MHz) / 2^prescaler: 4 -> 2.625 MHz, 5 -> 1.3125 MHz. */
+/* The chip allows 10 MHz; 1.3 MHz is chosen for jumper-wire margin.   */
+#define SPI_BUS_PRESCALER         5U
+#define SPI_TIMEOUT_MS            100U
+/* Oversampling codes: 0=skip, 1=x1, 2=x2, 3=x4, 4=x8, 5=x16.        */
+/* x2/x16/x1 with the coefficient-4 IIR filter is the datasheet's     */
+/* "weather monitoring" compromise: ~46 ms per cycle, low noise.      */
+#define BME280_OSRS_T             0x02U
+#define BME280_OSRS_P             0x05U
+#define BME280_OSRS_H             0x01U
+/* IIR filter on the pressure chain: 0=off, 1=2, 2=4, 3=8, 4=16.     */
+#define BME280_FILTER             0x02U
+/* Standby time (only used in normal mode; we run forced mode).       */
+#define BME280_STANDBY_MS         0x00U    /* 0.5 ms                  */
+/* One forced measurement every 500 ms -> two display/log updates per */
+/* second. Must stay above the chip cycle time (~46 ms here).        */
+#define SENSOR_PERIOD_MS          500U
+/* Log cadence: same as the sampling by default. Set to 0 to keep the */
+/* sensor line on screen but silent on USART1.                        */
+#define SENSOR_LOG_PERIOD_MS      500U
+/* Give up a measurement that never completes instead of hanging.     */
+#define SENSOR_TIMEOUT_MS         500U
+/* Re-probe a chip that is not on the bus this often (10 s is the     */
+/* same rhythm the dead SSD1306 uses, so a hot plug-in works).        */
+#define SENSOR_RETRY_MS           10000U
+
+/* ------------------------------------------------------------------ */
 /* SSD1306 panel                                                       */
 /* ------------------------------------------------------------------ */
 /* Set to 32 for the 2.23"/3.12" 128x32 modules, 64 for 0.96"       */
@@ -89,6 +121,10 @@
 /* redraw at 30 fps so animations look smooth and the clock is always */
 /* in sync within one frame. Set to 1000 for a strictly 1 s refresh. */
 #define UI_FRAME_MS               33U
+/* Sensor row: 0 = hidden, 1 = always shown (128x32 shrinks the big   */
+/* digits from 20 to 15 px to make room for it). The line itself is   */
+/* "T:23.4°C RH:45% P:1013hPa" in the 4x6 font.                      */
+#define UI_SHOW_SENSOR            1
 /* How long an "update animation" lasts after the seconds tick over.  */
 #define ANIM_DURATION_MS          600U
 /* Animation recipe: 0 = static face, 1 = digit roll,

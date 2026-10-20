@@ -1,13 +1,14 @@
 # STM32F401CEU6 "Retro Casio" Desk Clock
 
 A desk clock built around three I2C peripherals sharing **I2C1 (PB8 =
-SCL, PB9 = SDA @ 400 kHz)**:
+SCL, PB9 = SDA @ 400 kHz)** plus one SPI sensor:
 
-| Component | Driver | Address | Role |
-|---|---|---|---|
-| SSD1306 128×32 OLED | `Core/Src/ssd1306.c` | `0x3C` | Displays the Casio-style clock face |
-| DS1307 RTC | `Core/Src/ds1307.c` | `0x68` | Source of the current time |
-| AT24C32 EEPROM | `Core/Src/at24.c` | `0x50` | Keeps a backup of the last trusted time |
+| Component | Driver | Bus | Address / pins | Role |
+|---|---|---|---|---|
+| SSD1306 128×32 OLED | `Core/Src/ssd1306.c` | I2C1 | `0x3C` | Displays the Casio-style clock face |
+| DS1307 RTC | `Core/Src/ds1307.c` | I2C1 | `0x68` | Source of the current time |
+| AT24C32 EEPROM | `Core/Src/at24.c` | I2C1 | `0x50` | Keeps a backup of the last trusted time |
+| BME280 T/P/RH | `Core/Src/bme280.c` | SPI2 | PB13/14/15 + PB12 CS | Temperature, humidity, pressure line + log |
 
 A USB-TTL adapter on **USART1 (PA9 TX / PA10 RX, 115200 8N1)** carries
 the log (`Core/Src/ilog.c`). There are no buttons: the flow is fully
@@ -85,9 +86,11 @@ of a bogus 2000-01-01.
 
 ```
 boot:  i2c_bus_init → i2c_bus_scan → acquire_time → log →
+       spi_bus_init → bme280_init → one blocking sample →
        ssd1306_init → face_init → face_draw → ssd1306_flush
 loop:  every 1000 ms  → acquire_time() (RTC / seed / backup)
-       every UI_FRAME_MS (33 ms) → if panel alive: face_draw + flush,
+       every UI_FRAME_MS (33 ms) → sensor_update() (2 Hz sample + log),
+                                   if panel alive: face_draw + flush,
                                    else retry init every SCREEN_RETRY_MS
        pad with HAL_Delay(2) to keep frame pacing steady
 ```
@@ -97,7 +100,133 @@ the roll animation stays smooth while I2C traffic stays low.
 
 ---
 
-## 5. UML: sequence from power-on to displaying the current time
+## 5. BME280 sensor flow (`bme280.c`, `spi_bus.c`, `sensor_update()` in `main.c`)
+
+### 5.1 Wiring
+
+The sensor is on **SPI2**, not on the I2C bus:
+
+| Signal | MCU pin | Notes |
+|---|---|---|
+| SCK | **PB13** (SPI2_SCK, AF5) | 1.3125 MHz = APB1 42 MHz / 2^`SPI_BUS_PRESCALER` (5) |
+| MISO | **PB14** (SPI2_MISO, AF5) | sensor SDO → MCU |
+| MOSI | **PB15** (SPI2_MOSI, AF5) | sensor SDI → MCU |
+| CS | **PB12** (GPIO output) | active low, asserted per transaction |
+| CSB | sensor pin | tie to **GND** → SPI mode (tied high = I2C mode) |
+| SDA/SDI | sensor pin | tie to **3V3** in SPI mode |
+
+SPI1 (`PA4/PA5/PA6/PA7`) is deliberately unused: on the Black Pill those
+four pins are routed to the SPI-flash footprint on the underside of the
+board. PB12..PB15 are 5 V tolerant and free in this project.
+
+`spi_bus.c` is protocol-agnostic (`spi_bus_cs()` +
+`spi_bus_transfer()`); the BME280 command framing — bit 7 of the first
+byte = 1 for read, 0 for write, bits 6..0 = register — lives in
+`bme280.c`. Mode 0 (CPOL 0 / CPHA 0), MSB first.
+
+### 5.2 Sampling: forced mode, twice a second
+
+The 30 fps UI loop must never wait on the sensor, so the driver runs
+forced mode as a non-blocking state machine inside the frame loop:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Main as main.c (sensor_update)
+    participant Sen as bme280.c
+    participant Bus as spi_bus.c
+    participant Chip as BME280 (SPI2)
+
+    loop every SENSOR_PERIOD_MS (500 ms)
+        Main->>Sen: bme280_measure()
+        Sen->>Bus: cs low, 0x74, 0xA5 (osrs_t x2 / osrs_p x16 / forced)
+        Bus->>Chip: ctrl_meas 0xF4
+        Note over Sen: state ARMED -> RUNNING, never blocks the frame loop
+    end
+    loop every frame (33 ms) until the conversion finishes
+        Main->>Sen: bme280_is_measuring()
+        Sen->>Bus: 0xF3 status read
+        Bus->>Chip: read 0xF3
+        Chip-->>Sen: bit 3 = 1 (busy), clears after ~46 ms
+    end
+    Main->>Sen: bme280_read()
+    Sen->>Bus: 0xF7, then 8 bytes
+    Bus->>Chip: burst read P[23:4], T[19:0], H[15:0]
+    Sen->>Sen: comp_temp -> comp_press -> comp_hum (same t_fine)
+    Sen-->>Main: temp_c_x100, press_pa_x100, rh_x1024
+    Main->>Main: 2 Hz: LOGI("sensor: T=23.4 C RH=45.1% P=1013.3 hPa")
+    Main->>Main: face_draw() shows the same numbers
+```
+
+If a conversion does not finish within `SENSOR_TIMEOUT_MS`, or the chip
+stops answering, the driver reports failure, the row shows
+`T:--.-°C RH:--% P:----hPa`, and the next probe happens after
+`SENSOR_RETRY_MS` (10 s) instead of every frame.
+
+### 5.3 Compensation and units
+
+`bme280.c` uses Bosch's integer (fixed-point) formulas — no floats, no
+`printf` float support. Field units:
+
+| Field | Unit | Note |
+|---|---|---|
+| `temp_c_x100` | 0.01 °C | datasheet formula |
+| `press_pa_x100` | 0.01 Pa | datasheet 64-bit formula (1/256 Pa intermediate) |
+| `rh_x1024` | 0.001 %RH? **no: 1/1024 %RH** | see below |
+
+The datasheet comment for `compensate_H_int32` claims a 1/1000
+resolution, but its own arithmetic and clamps say otherwise: `var5`
+ends as `2^22 × %RH`, the `419430400` clamp is `100 %RH × 2^22`, and
+the `102400` clamp is `100 %RH × 1024`. So the value after `/4096` is
+Q10 fixed point (TI's port documents it the same way). Reading it as
+1/1000 makes humidity 2.4 % too high. The host test checks exactly
+this.
+
+One deliberate deviation from the datasheet: the temperature chain's
+two intermediate products (`(adc_t/16 − t1)²`, then `× t3`) are done in
+`int64`. With a trim like `t3 = 10952` the 32-bit version overflows
+near `adc_t ≈ 460000` (about +50 °C) and the reported temperature
+jumps from +50 °C to −1 °C. Same results everywhere the 32-bit version
+is valid, no garbage outside it.
+
+### 5.4 Display row
+
+The sensor line is drawn in a second, smaller font (`Core/Src/font4x6.c`,
+4×6 px, generated by `tools/gen_font4x6.py`) so it fits the 128 px
+panel:
+
+```
+row 0        bezel
+rows 1..7    date, 5x7 font
+rows 9..14   "T:23.4°C RH:45% P:1013hPa"  (25 chars x 5 px = 124 px)
+row 15       gutter
+rows 16..30  HH:MM:SS, digits shrunk 20 -> 15 px
+row 31       bezel
+```
+
+`°` is a pseudo-glyph at code `0x7F` (`CH_DEGREE` in `gfx.h`) in both
+font tables. If a reading is wide enough to overflow the panel
+(`T:-40.0°C RH:100% P:1100hPa` = 135 px), the spaces are dropped
+(125 px). Set `UI_SHOW_SENSOR 0` to get the original 20 px digits back
+and hide the row.
+
+### 5.5 Host test
+
+```sh
+tools/sensor_test/run.sh   # compiles bme280.c against an emulated SPI slave
+```
+
+It checks: probe + chip id, soft reset `0xE0 = 0xB6` and the NVM-copy
+wait, that `ctrl_hum` is written before `ctrl_meas`, register-block
+parsing (`0x88..0xA1`, `0xE1..0xE7`, the packed `dig_H4/H5` nibbles),
+SPI command framing and CS usage, the forced-mode busy handshake, that
+a missing or foreign chip is handled, and a 512-point sweep comparing
+the integer compensation against Bosch's double-precision formulas
+(worst deviation in the current run: 0.005 °C, 0.02 Pa, 0.005 %RH).
+It also sweeps 30..70 °C to prove the temperature output stays
+monotonic and inside the datasheet range.
+
+## 6. UML: sequence from power-on to displaying the current time
 
 ```mermaid
 sequenceDiagram
@@ -116,6 +245,8 @@ sequenceDiagram
     Main->>Bus: i2c_bus_init() — I2C1 PB8/PB9 @400 kHz
     Main->>Bus: i2c_bus_scan() — dump which addresses ACK
     Main->>Main: acquire_time()
+    Main->>Main: spi_bus_init() — SPI2 PB13/14/15, CS PB12
+    Main->>Main: bme280_init() + one blocking sample (see section 5)
 
     alt RTC answers and is running
         Main->>RTC: ds1307_read() — reg read 0x00..0x07
@@ -164,6 +295,7 @@ sequenceDiagram
         end
     end
     loop every UI_FRAME_MS (33 ms)
+        Main->>Main: sensor_update() — 2 Hz forced-mode sample + log
         Main->>Disp: ssd1306_is_alive()?
         alt alive
             Main->>Face: face_draw() — digit roll / colon pulse
@@ -175,7 +307,7 @@ sequenceDiagram
     end
 ```
 
-## 6. Detailed: SSD1306 command sequence (init + per-frame addressing)
+## 7. Detailed: SSD1306 command sequence (init + per-frame addressing)
 
 **I2C framing first.** The panel lives at a *single* 7-bit address,
 `0x3C` — command vs. data is **not** selected by a second address but
@@ -254,5 +386,17 @@ make            # arm-none-eabi toolchain; output in build/stm32f401ceux.elf
 ```
 
 Flash `build/stm32f401ceux.elf` (ST-Link), wire the three I2C modules
-to PB8/PB9 with pull-ups to 3.3 V, and check the log on USART1 at
-115200 to see which time source was chosen.
+to PB8/PB9 with pull-ups to 3.3 V, wire the BME280 to PB13/PB14/PB15
+with CS on PB12 (CSB to GND), and check the log on USART1 at 115200 to
+see which time source was chosen and the 2 Hz sensor line.
+
+Pin setup is done in code (`stm32f4xx_hal_msp.c`, `spi_bus.c`,
+`i2c_bus.c`), not by the `.ioc` — the CubeMX file in the repo is out of
+date.
+
+```sh
+tools/face_preview/run.sh    # ASCII render of the face: fonts, layout, animation
+tools/sensor_test/run.sh     # BME280 driver test against an emulated SPI slave
+tools/gen_font.py            # regenerate Core/Src/font5x7.c
+tools/gen_font4x6.py         # regenerate Core/Src/font4x6.c
+```
